@@ -1,4 +1,4 @@
-﻿"""
+"""
 Soyuz backend – FastAPI application.
 
 Routes
@@ -38,7 +38,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import (
@@ -193,7 +193,7 @@ async def login(
     * Subscription status is enforced; expired accounts get 403.
     """
     # 1. Find account
-    result = await db.execute(select(Account).where(Account.login == body.login))
+    result = await db.execute(select(Account).where(func.lower(Account.login) == func.lower(body.login)))
     account: Account | None = result.scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
