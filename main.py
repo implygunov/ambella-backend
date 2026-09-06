@@ -36,7 +36,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,7 +52,13 @@ from auth import (
 )
 from config import settings
 from database import Account, AsyncSessionLocal, Product, Version, get_db, init_db
-from storage import delete_file, generate_presigned_url, upload_file
+from storage import (
+    delete_file,
+    generate_presigned_url,
+    get_local_file_path,
+    is_r2_configured,
+    upload_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -295,8 +301,8 @@ async def download_version(
     version_id: int,
     _account: Annotated[Account, Depends(get_current_account)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> RedirectResponse:
-    """Redirect the client to a short-lived presigned R2 download URL."""
+):
+    """Serve DLL directly or redirect to Cloudflare R2 presigned URL."""
     result = await db.execute(
         select(Version).where(Version.id == version_id, Version.is_active.is_(True))
     )
@@ -304,8 +310,18 @@ async def download_version(
     if version is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
 
-    presigned_url = generate_presigned_url(version.file_key, expires=3600)
-    return RedirectResponse(url=presigned_url, status_code=status.HTTP_302_FOUND)
+    if is_r2_configured():
+        presigned_url = generate_presigned_url(version.file_key, expires=3600)
+        return RedirectResponse(url=presigned_url, status_code=status.HTTP_302_FOUND)
+    else:
+        local_path = get_local_file_path(version.file_key)
+        if not os.path.exists(local_path):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on server")
+        return FileResponse(
+            local_path,
+            filename=f"payload_{version.version_string}.dll",
+            media_type="application/octet-stream",
+        )
 
 
 # ===========================================================================

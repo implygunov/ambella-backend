@@ -1,4 +1,5 @@
-﻿import uuid
+import os
+import uuid
 from typing import Tuple
 
 import boto3
@@ -6,6 +7,19 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from config import settings
+
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def is_r2_configured() -> bool:
+    """Check if Cloudflare R2 credentials are provided."""
+    return bool(
+        settings.CF_ACCOUNT_ID
+        and settings.CF_ACCESS_KEY_ID
+        and settings.CF_SECRET_ACCESS_KEY
+        and settings.CF_ACCOUNT_ID.strip()
+    )
 
 
 def _get_client():
@@ -21,47 +35,59 @@ def _get_client():
 
 
 def upload_file(file_bytes: bytes, filename: str, content_type: str) -> Tuple[str, str]:
-    """Upload *file_bytes* to R2 under a unique key derived from *filename*.
-
-    Returns:
-        (file_key, public_url) where file_key is the R2 object key and
-        public_url is the publicly accessible URL for the object.
-    """
+    """Upload *file_bytes* to R2 (or local fallback) under a unique key."""
     ext = filename.rsplit(".", 1)[-1] if "." in filename else "bin"
-    file_key = f"files/{uuid.uuid4().hex}.{ext}"
+    file_id = f"{uuid.uuid4().hex}.{ext}"
 
-    client = _get_client()
-    client.put_object(
-        Bucket=settings.CF_BUCKET_NAME,
-        Key=file_key,
-        Body=file_bytes,
-        ContentType=content_type,
-    )
+    if is_r2_configured():
+        file_key = f"files/{file_id}"
+        client = _get_client()
+        client.put_object(
+            Bucket=settings.CF_BUCKET_NAME,
+            Key=file_key,
+            Body=file_bytes,
+            ContentType=content_type,
+        )
+        public_url = f"{settings.CF_PUBLIC_URL.rstrip('/')}/{file_key}"
+        return file_key, public_url
+    else:
+        # Local storage fallback
+        local_path = os.path.join(UPLOAD_DIR, file_id)
+        with open(local_path, "wb") as f:
+            f.write(file_bytes)
+        return file_id, f"/local/{file_id}"
 
-    public_url = f"{settings.CF_PUBLIC_URL.rstrip('/')}/{file_key}"
-    return file_key, public_url
+
+def get_local_file_path(file_key: str) -> str:
+    """Return local path for a stored file."""
+    # handle both "files/xxx" or "xxx"
+    filename = os.path.basename(file_key)
+    return os.path.join(UPLOAD_DIR, filename)
 
 
 def delete_file(file_key: str) -> None:
-    """Delete the object identified by *file_key* from R2.
-
-    Silently ignores NoSuchKey errors so callers need not check existence first.
-    """
-    client = _get_client()
-    try:
-        client.delete_object(Bucket=settings.CF_BUCKET_NAME, Key=file_key)
-    except ClientError as exc:
-        error_code = exc.response.get("Error", {}).get("Code", "")
-        if error_code not in ("NoSuchKey", "404"):
-            raise
+    """Delete the object identified by *file_key* from R2 or local disk."""
+    if is_r2_configured():
+        client = _get_client()
+        try:
+            client.delete_object(Bucket=settings.CF_BUCKET_NAME, Key=file_key)
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "")
+            if error_code not in ("NoSuchKey", "404"):
+                raise
+    else:
+        local_path = get_local_file_path(file_key)
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
 
 
 def generate_presigned_url(file_key: str, expires: int = 3600) -> str:
-    """Return a pre-signed GET URL for *file_key* that is valid for *expires* seconds.
-
-    This is useful when the bucket is private and direct downloads must be
-    time-limited.
-    """
+    """Return a pre-signed GET URL for *file_key* that is valid for *expires* seconds."""
+    if not is_r2_configured():
+        return f"/api/files/download/{file_key}"
     client = _get_client()
     url: str = client.generate_presigned_url(
         "get_object",
