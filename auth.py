@@ -22,8 +22,11 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 def verify_password(plain: str, hashed: str) -> bool:
     """Return True if the plain-text password matches the stored bcrypt or sha256 hash."""
     import hashlib
-    if len(hashed) == 64 and hashlib.sha256(plain.encode()).hexdigest() == hashed:
-        return True
+    import hmac
+    if len(hashed) == 64:
+        expected = hashlib.sha256(plain.encode()).hexdigest()
+        if hmac.compare_digest(expected, hashed):
+            return True
     try:
         return pwd_context.verify(plain, hashed)
     except Exception:

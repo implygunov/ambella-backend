@@ -21,6 +21,7 @@ Admin  (X-Admin-Key header required)
 
 from __future__ import annotations
 
+import os
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -97,7 +98,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -207,6 +208,11 @@ async def login(
     # 2. Verify password
     if not verify_password(body.password, account.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+    # Auto-migrate legacy SHA-256 hash to bcrypt
+    if len(account.password_hash) == 64:
+        account.password_hash = hash_password(body.password)
+        await db.flush()
 
     # 3. HWID check / bind
     if not account.hwid:

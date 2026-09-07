@@ -1,4 +1,4 @@
-﻿from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings
 from functools import lru_cache
 
 
@@ -13,6 +13,13 @@ class Settings(BaseSettings):
 
     # Admin
     ADMIN_KEY: str = "change-admin-key-in-production"
+
+    # CORS
+    ALLOWED_ORIGINS: list[str] = [
+        "http://localhost:3000",
+        "http://localhost:5000",
+        "http://127.0.0.1:5000",
+    ]
 
     # Cloudflare R2
     CF_ACCOUNT_ID: str = ""
