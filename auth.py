@@ -19,14 +19,24 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 # Password helpers
 # ---------------------------------------------------------------------------
 
+import bcrypt
+
 def verify_password(plain: str, hashed: str) -> bool:
     """Return True if the plain-text password matches the stored bcrypt or sha256 hash."""
+    if not hashed:
+        return False
     import hashlib
     import hmac
     if len(hashed) == 64:
         expected = hashlib.sha256(plain.encode()).hexdigest()
         if hmac.compare_digest(expected, hashed):
             return True
+    try:
+        if hashed.startswith("$2a$") or hashed.startswith("$2b$") or hashed.startswith("$2y$"):
+            pw_bytes = plain.encode('utf-8')[:72]
+            return bcrypt.checkpw(pw_bytes, hashed.encode('utf-8'))
+    except Exception:
+        pass
     try:
         return pwd_context.verify(plain, hashed)
     except Exception:
@@ -35,7 +45,9 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def hash_password(password: str) -> str:
     """Return a bcrypt hash of the given password."""
-    return pwd_context.hash(password)
+    pw_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(pw_bytes, salt).decode('utf-8')
 
 
 # ---------------------------------------------------------------------------

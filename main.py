@@ -118,6 +118,7 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     token: str
     login: str
+    uid: int | None = None
     subscription_expires: str | None
     is_active: bool
 
@@ -237,6 +238,7 @@ async def login(
     return LoginResponse(
         token=token,
         login=account.login,
+        uid=account.id,
         subscription_expires=_fmt_dt(account.subscription_expires),
         is_active=_is_subscription_active(account),
     )
