@@ -14,9 +14,28 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from config import settings
+def _normalize_db_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://") and not url.startswith("postgresql+asyncpg://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if "?" in url:
+        base, query = url.split("?", 1)
+        params = [p for p in query.split("&") if not p.startswith("sslmode=")]
+        url = base + ("?" + "&".join(params) if params else "")
+    return url
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False, pool_pre_ping=True)
+
+db_url = _normalize_db_url(settings.DATABASE_URL)
+engine_kwargs = {"echo": False, "pool_pre_ping": True}
+if "localhost" not in db_url and "127.0.0.1" not in db_url:
+    import ssl
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    engine_kwargs["connect_args"] = {"ssl": ssl_ctx}
+
+engine = create_async_engine(db_url, **engine_kwargs)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
@@ -92,6 +111,28 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
+from sqlalchemy import text
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # Run non-destructive column additions for PostgreSQL
+        migrations = [
+            "ALTER TABLE versions ADD COLUMN IF NOT EXISTS file_data BYTEA;",
+            "ALTER TABLE versions ADD COLUMN IF NOT EXISTS changelog TEXT DEFAULT '';",
+            "ALTER TABLE versions ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;",
+            "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS user_id VARCHAR(64);",
+            "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS hwid VARCHAR(256) DEFAULT '';",
+            "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_paid BOOLEAN DEFAULT FALSE;",
+            "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS payment_date TIMESTAMPTZ;",
+            "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS subscription_expires TIMESTAMPTZ;",
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';",
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;",
+        ]
+        for stmt in migrations:
+            try:
+                await conn.execute(text(stmt))
+            except Exception:
+                pass

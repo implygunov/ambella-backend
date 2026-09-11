@@ -33,11 +33,12 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,20 +70,23 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Product).limit(1))
-        if result.scalar_one_or_none() is None:
-            session.add(
-                Product(
-                    name="RustMe",
-                    slug="rustme",
-                    description="Premium Rust cheat loader",
-                    is_active=True,
+    try:
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(Product).limit(1))
+            if result.scalar_one_or_none() is None:
+                session.add(
+                    Product(
+                        name="RustMe",
+                        slug="rustme",
+                        description="Premium Rust cheat loader",
+                        is_active=True,
+                    )
                 )
-            )
-            await session.commit()
-            logger.info("Seeded default product 'RustMe'.")
+                await session.commit()
+                logger.info("Seeded default product 'RustMe'.")
+    except Exception as exc:
+        logger.exception(f"Database initialization warning / error: {exc}")
     yield
 
 
@@ -104,6 +108,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Global Exception Handler (returns detailed error in JSON instead of blank 500)
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled error during {request.method} {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Internal Server Error",
+            "detail": str(exc),
+            "type": type(exc).__name__,
+            "path": str(request.url.path),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Health & Keep-Alive endpoints (UptimeRobot / cron-job.org / Render 24/7)
 # ---------------------------------------------------------------------------
@@ -117,6 +140,32 @@ async def health_check() -> dict:
         "service": "Ambella Backend",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "storage": "Cloudflare R2" if is_r2_configured() else "Database (PostgreSQL BYTEA - 100% Free Persistent)",
+    }
+
+
+@app.get("/api/diag", tags=["system"])
+async def diagnostic_check(db: Annotated[AsyncSession, Depends(get_db)]) -> dict:
+    """Diagnostic endpoint to inspect DB health, tables, and connection status."""
+    from sqlalchemy import text
+    try:
+        res = await db.execute(text("SELECT 1;"))
+        db_ok = bool(res.scalar() == 1)
+    except Exception as e:
+        return {"status": "error", "database_connected": False, "error": str(e)}
+
+    # Check columns in versions table
+    try:
+        cols_res = await db.execute(text(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'versions';"
+        ))
+        versions_cols = [f"{r[0]} ({r[1]})" for r in cols_res.fetchall()]
+    except Exception as e:
+        versions_cols = [f"Error checking columns: {e}"]
+
+    return {
+        "status": "online",
+        "database_connected": db_ok,
+        "versions_columns": versions_cols,
     }
 
 # ---------------------------------------------------------------------------
