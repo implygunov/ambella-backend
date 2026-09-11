@@ -37,7 +37,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -105,6 +105,21 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Health & Keep-Alive endpoints (UptimeRobot / cron-job.org / Render 24/7)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/health", tags=["system"])
+@app.get("/ping", tags=["system"])
+async def health_check() -> dict:
+    """Health check endpoint used by uptime monitors (UptimeRobot, cron-job.org) to keep Render awake 24/7."""
+    return {
+        "status": "online",
+        "service": "Ambella Backend",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "storage": "Cloudflare R2" if is_r2_configured() else "Database (PostgreSQL BYTEA - 100% Free Persistent)",
+    }
+
+# ---------------------------------------------------------------------------
 # Pydantic schemas
 # ---------------------------------------------------------------------------
 
@@ -169,6 +184,34 @@ class ExtendRequest(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+
+class AdminProductOut(BaseModel):
+    id: int
+    name: str
+    slug: str
+    description: str
+    is_active: bool
+    versions_count: int = 0
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class AdminVersionOut(BaseModel):
+    id: int
+    product_id: int
+    product_name: str = ""
+    version_string: str
+    changelog: str
+    is_active: bool
+    storage_type: str
+    has_file: bool
+    created_at: str
+
+    class Config:
+        from_attributes = True
 
 
 # ---------------------------------------------------------------------------
@@ -304,13 +347,57 @@ async def list_versions(
     ]
 
 
+@app.get("/api/versions/latest/download", tags=["products"])
+async def download_latest_version(
+    _account: Annotated[Account, Depends(get_current_account)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Serve the latest active client version directly."""
+    result = await db.execute(
+        select(Version).where(Version.is_active.is_(True)).order_by(Version.created_at.desc()).limit(1)
+    )
+    version: Version | None = result.scalar_one_or_none()
+    
+    if version is not None:
+        # 1. Pure database storage (Free, persistent forever in PostgreSQL)
+        if version.file_data:
+            return Response(
+                content=version.file_data,
+                media_type="application/octet-stream",
+                headers={"Content-Disposition": f'attachment; filename="payload_{version.version_string}.dll"'}
+            )
+        
+        # 2. Local uploads folder fallback
+        if not is_r2_configured():
+            local_path = get_local_file_path(version.file_key)
+            if os.path.exists(local_path):
+                return FileResponse(local_path, media_type="application/octet-stream", filename=f"payload_{version.version_string}.dll")
+
+        # 3. Cloudflare R2 redirect
+        if is_r2_configured():
+            presigned_url = generate_presigned_url(version.file_key, expires=3600)
+            return RedirectResponse(url=presigned_url, status_code=status.HTTP_302_FOUND)
+
+    # 4. Fallback to local built ambella.dll if in repository
+    repo_dll = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin", "Release", "x64", "ambella.dll"))
+    if not os.path.exists(repo_dll):
+        repo_dll = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ambella.dll"))
+    if os.path.exists(repo_dll):
+        return FileResponse(repo_dll, media_type="application/octet-stream", filename="ambella.dll")
+
+    if version is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active versions found")
+    
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on server")
+
+
 @app.get("/api/versions/{version_id}/download", tags=["products"])
 async def download_version(
     version_id: int,
     _account: Annotated[Account, Depends(get_current_account)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Serve DLL directly or redirect to Cloudflare R2 presigned URL."""
+    """Serve DLL directly from database, local disk, or redirect to Cloudflare R2 presigned URL."""
     result = await db.execute(
         select(Version).where(Version.id == version_id, Version.is_active.is_(True))
     )
@@ -318,18 +405,34 @@ async def download_version(
     if version is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
 
+    # 1. Pure database storage (Free, persistent forever in PostgreSQL)
+    if version.file_data:
+        return Response(
+            content=version.file_data,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="payload_{version.version_string}.dll"'}
+        )
+
+    # 2. Cloudflare R2 redirect
     if is_r2_configured():
         presigned_url = generate_presigned_url(version.file_key, expires=3600)
         return RedirectResponse(url=presigned_url, status_code=status.HTTP_302_FOUND)
     else:
+        # 3. Local disk fallback
         local_path = get_local_file_path(version.file_key)
-        if not os.path.exists(local_path):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on server")
-        return FileResponse(
-            local_path,
-            filename=f"payload_{version.version_string}.dll",
-            media_type="application/octet-stream",
-        )
+        if os.path.exists(local_path):
+            return FileResponse(
+                local_path,
+                filename=f"payload_{version.version_string}.dll",
+                media_type="application/octet-stream",
+            )
+        # 4. Check repo bin or root
+        repo_dll = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin", "Release", "x64", "ambella.dll"))
+        if not os.path.exists(repo_dll):
+            repo_dll = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ambella.dll"))
+        if os.path.exists(repo_dll):
+            return FileResponse(repo_dll, media_type="application/octet-stream", filename="ambella.dll")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on server")
 
 
 # ===========================================================================
@@ -379,14 +482,29 @@ async def admin_create_version(
     changelog: str = Form(""),
     file: UploadFile = File(...),
 ) -> VersionOut:
-    """Upload a DLL to R2 and register a new version in the database."""
+    """Upload a DLL and register a new version.
+    - If Cloudflare R2 is configured, uploads to R2 bucket.
+    - If R2 is NOT configured, stores binary directly in PostgreSQL (BYTEA column) — 100% Free & Persistent!
+    """
     prod_result = await db.execute(select(Product).where(Product.id == product_id))
     if prod_result.scalar_one_or_none() is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
     file_bytes = await file.read()
     content_type = file.content_type or "application/octet-stream"
-    file_key, public_url = upload_file(file_bytes, file.filename or "cheat.dll", content_type)
+
+    if is_r2_configured():
+        file_key, public_url = upload_file(file_bytes, file.filename or "ambella.dll", content_type)
+        file_data = None
+    else:
+        # Free Database Storage (PostgreSQL BYTEA) - persists across Render restarts
+        file_key = f"db:{file.filename or 'ambella.dll'}"
+        public_url = f"/api/versions/{version_string}/download"
+        file_data = file_bytes
+        try:
+            upload_file(file_bytes, file.filename or "ambella.dll", content_type)
+        except Exception:
+            pass
 
     version = Version(
         product_id=product_id,
@@ -394,6 +512,7 @@ async def admin_create_version(
         changelog=changelog,
         file_key=file_key,
         file_url=public_url,
+        file_data=file_data,
         is_active=True,
     )
     db.add(version)
@@ -472,3 +591,125 @@ async def admin_reset_hwid(
     account.hwid = ""
     await db.flush()
     return MessageResponse(message=f"HWID reset for account '{login}'.")
+
+
+@app.get(
+    "/api/admin/products",
+    response_model=list[AdminProductOut],
+    tags=["admin"],
+)
+async def admin_list_products(
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[AdminProductOut]:
+    """List all products with version count (useful for finding product IDs to delete or update in /docs)."""
+    result = await db.execute(select(Product).order_by(Product.id.asc()))
+    products = result.scalars().all()
+    out = []
+    for p in products:
+        v_res = await db.execute(select(func.count(Version.id)).where(Version.product_id == p.id))
+        v_count = v_res.scalar() or 0
+        out.append(AdminProductOut(
+            id=p.id,
+            name=p.name,
+            slug=p.slug,
+            description=p.description,
+            is_active=p.is_active,
+            versions_count=v_count,
+            created_at=_fmt_dt(p.created_at) or "",
+        ))
+    return out
+
+
+@app.delete(
+    "/api/admin/products/{product_id}",
+    response_model=MessageResponse,
+    tags=["admin"],
+)
+async def admin_delete_product(
+    product_id: int,
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MessageResponse:
+    """Delete a product and all its versions from the database and storage."""
+    result = await db.execute(select(Product).where(Product.id == product_id))
+    product = result.scalar_one_or_none()
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+
+    # Clean up associated files if in R2 or disk
+    v_res = await db.execute(select(Version).where(Version.product_id == product_id))
+    for v in v_res.scalars().all():
+        if v.file_key and not v.file_key.startswith("db:"):
+            try:
+                delete_file(v.file_key)
+            except Exception:
+                pass
+
+    await db.delete(product)
+    await db.flush()
+    return MessageResponse(message=f"Product '{product.name}' (ID: {product_id}) and all its versions were deleted successfully.")
+
+
+@app.get(
+    "/api/admin/versions",
+    response_model=list[AdminVersionOut],
+    tags=["admin"],
+)
+async def admin_list_versions(
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    product_id: int | None = None,
+) -> list[AdminVersionOut]:
+    """List all registered versions (useful for finding version IDs to delete or manage in /docs)."""
+    query = select(Version).order_by(Version.id.desc())
+    if product_id is not None:
+        query = query.where(Version.product_id == product_id)
+    result = await db.execute(query)
+    versions = result.scalars().all()
+    out = []
+    for v in versions:
+        prod = await db.execute(select(Product.name).where(Product.id == v.product_id))
+        p_name = prod.scalar_one_or_none() or ""
+        storage_type = "Database (BYTEA - Free)" if v.file_data is not None else ("Cloudflare R2" if is_r2_configured() else "Local Disk")
+        has_file = (v.file_data is not None) or (bool(v.file_key) and not v.file_key.startswith("db:"))
+        out.append(AdminVersionOut(
+            id=v.id,
+            product_id=v.product_id,
+            product_name=p_name,
+            version_string=v.version_string,
+            changelog=v.changelog,
+            is_active=v.is_active,
+            storage_type=storage_type,
+            has_file=has_file,
+            created_at=_fmt_dt(v.created_at) or "",
+        ))
+    return out
+
+
+@app.delete(
+    "/api/admin/versions/{version_id}",
+    response_model=MessageResponse,
+    tags=["admin"],
+)
+async def admin_delete_version(
+    version_id: int,
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MessageResponse:
+    """Delete a specific version and its stored DLL file."""
+    result = await db.execute(select(Version).where(Version.id == version_id))
+    version = result.scalar_one_or_none()
+    if version is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
+
+    if version.file_key and not version.file_key.startswith("db:"):
+        try:
+            delete_file(version.file_key)
+        except Exception:
+            pass
+
+    await db.delete(version)
+    await db.flush()
+    return MessageResponse(message=f"Version '{version.version_string}' (ID: {version_id}) was deleted successfully.")
+

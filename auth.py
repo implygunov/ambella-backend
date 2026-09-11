@@ -147,7 +147,11 @@ async def get_current_account_no_sub_check(
 # Admin dependency
 # ---------------------------------------------------------------------------
 
-async def require_admin(x_admin_key: Annotated[str | None, Header()] = None) -> None:
-    """Validate the X-Admin-Key header against ADMIN_KEY env var."""
-    if x_admin_key != settings.ADMIN_KEY:
+async def require_admin(
+    x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None,
+    admin_key: str | None = None,
+) -> None:
+    """Validate the X-Admin-Key header or admin_key parameter against ADMIN_KEY env var."""
+    key = x_admin_key or admin_key
+    if not key or key != settings.ADMIN_KEY:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin key")

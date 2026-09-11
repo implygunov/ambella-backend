@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime
 from typing import AsyncGenerator
 
 from sqlalchemy import (
@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     func,
@@ -72,6 +73,7 @@ class Version(Base):
     changelog: Mapped[str] = mapped_column(Text, nullable=False, default="")
     file_key: Mapped[str] = mapped_column(String(512), nullable=False)
     file_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    file_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
